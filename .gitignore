@@ -1,0 +1,21 @@
+/target
+/signals
+/snapshots
+/dev.toml
+/tuned.toml
+/bench.md
+
+# Model weights are not in the repo. Fetch them with the commands in README.md.
+/models/*.onnx
+
+# Recorded footage: large, and pictures of real people.
+/samples/*.mp4
+/samples/*.mkv
+/samples/*.avi
+/samples/faces/*
+!/samples/faces/README
+/samples/objects/*
+
+# Local tooling
+/.claude/
+CLAUDE.md

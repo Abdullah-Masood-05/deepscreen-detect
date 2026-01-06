@@ -1,0 +1,40 @@
+[package]
+name = "deepscreen-detect"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Camera frames in, proctoring violations out. No Tauri, no UI, no browser."
+
+# NOTE: this crate must never gain a `tauri` dependency (MODELS.md §0).
+# The Tauri adapter depends on this crate, never the reverse.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+arc-swap = "1"
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+
+# Inference. Pinned to the same version the app already ships, so the two
+# cannot disagree about the ONNX Runtime binary. DirectML is deliberately NOT
+# enabled yet — build step 3 establishes the CPU baseline that step 5 has to
+# beat, and enabling both at once would make the jump unattributable.
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
+ndarray = "0.17"
+
+# SIMD resize. `image`'s Triangle filter is a measurable slice of the budget at
+# 15 Hz (MODELS.md §6 rule 4).
+fast_image_resize = "5"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "detect-cli"
+path = "src/bin/detect-cli.rs"
