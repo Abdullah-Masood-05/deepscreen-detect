@@ -1,0 +1,144 @@
+//! Replay regression suite (MODELS.md §10).
+//!
+//! The eventual shape: each labelled clip has a recorded `Signals` JSONL and an
+//! expected violation list, and this file asserts that fusion turns one into
+//! the other — with no camera, no GPU, and no models. Fusion lands at build
+//! step 8; until then these tests lock down the thing fusion depends on, which
+//! is that a recording survives the round trip through JSONL unchanged.
+//!
+//! The control clips matter more than the violation clips. False positives are
+//! what make a proctoring system unusable, and you cannot measure a
+//! false-positive rate without footage of innocent behaviour.
+
+use deepscreen_detect::types::{
+    BBox, EyeAspect, FaceDetection, Gaze, HeadPose, ObjectDetection, SignalCoverage, Signals,
+};
+use deepscreen_detect::Config;
+
+/// A synthetic clip: someone looking progressively further left while a phone
+/// enters frame. Stands in for real footage until the corpus is recorded.
+fn synthetic_look_away_with_phone(frames: u64, fps: f32) -> Vec<Signals> {
+    (0..frames)
+        .map(|seq| {
+            let t_ms = (seq as f64 * 1000.0 / fps as f64).round() as u64;
+            let yaw = -(seq as f32) * 1.5; // turning left over time
+            Signals {
+                seq,
+                t_ms,
+                faces: vec![FaceDetection {
+                    bbox: BBox { x: 400.0, y: 200.0, w: 220.0, h: 260.0 },
+                    score: 0.95,
+                    keypoints: None,
+                }],
+                head_pose: Some(HeadPose { yaw_deg: yaw, pitch_deg: 2.0, roll_deg: 0.5 }),
+                gaze: Some(Gaze {
+                    pitch_rad: 0.05,
+                    yaw_rad: yaw.to_radians() * 0.8,
+                    eye_yaw_rad: None,
+                    eye_pitch_rad: None,
+                }),
+                objects: if t_ms >= 2000 {
+                    vec![ObjectDetection {
+                        class_id: 67,
+                        label: "cell phone".into(),
+                        score: 0.71,
+                        bbox: BBox { x: 700.0, y: 380.0, w: 90.0, h: 170.0 },
+                    }]
+                } else {
+                    vec![]
+                },
+                identity_match: Some(0.68),
+                eye_aspect: Some(EyeAspect { left: 0.29, right: 0.30 }),
+                produced_by: SignalCoverage {
+                    face: true,
+                    pose: true,
+                    gaze: true,
+                    objects: t_ms >= 2000,
+                    identity: seq % 75 == 0,
+                },
+            }
+        })
+        .collect()
+}
+
+fn to_jsonl(signals: &[Signals]) -> String {
+    signals.iter().map(|s| serde_json::to_string(s).unwrap()).collect::<Vec<_>>().join("\n")
+}
+
+fn from_jsonl(text: &str) -> Vec<Signals> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_recording_survives_the_jsonl_round_trip_exactly() {
+    // This is the property every replay-based tuning session rests on: if the
+    // round trip is lossy, tuned thresholds do not mean what they claim.
+    let original = synthetic_look_away_with_phone(90, 15.0);
+    let replayed = from_jsonl(&to_jsonl(&original));
+    assert_eq!(original, replayed);
+}
+
+#[test]
+fn the_timebase_is_frame_derived_not_wall_clock() {
+    // Replay runs flat out, so timestamps must come from the frame index and
+    // the declared rate. Otherwise a fast machine and a slow one would tune to
+    // different thresholds from the same clip.
+    let signals = synthetic_look_away_with_phone(45, 15.0);
+    assert_eq!(signals[0].t_ms, 0);
+    assert_eq!(signals[15].t_ms, 1000);
+    assert_eq!(signals[44].t_ms, 2933);
+    assert!(signals.windows(2).all(|w| w[1].t_ms > w[0].t_ms), "timestamps must be monotonic");
+}
+
+#[test]
+fn coverage_distinguishes_absent_from_never_ran() {
+    let signals = synthetic_look_away_with_phone(45, 15.0);
+
+    let early = &signals[0];
+    assert!(early.objects.is_empty());
+    assert!(!early.produced_by.objects, "before 2s the object worker had not produced a result");
+
+    let late = signals.iter().find(|s| s.t_ms >= 2000).unwrap();
+    assert!(late.produced_by.objects);
+    assert_eq!(late.objects[0].label, "cell phone");
+}
+
+#[test]
+fn old_recordings_still_parse_after_signal_slots_are_added() {
+    // The corpus is the regression suite; it must outlive schema growth.
+    let line = r#"{"seq":7,"t_ms":466,"faces":[],"head_pose":null}"#;
+    let s: Signals = serde_json::from_str(line).unwrap();
+    assert_eq!(s.seq, 7);
+    assert!(s.eye_aspect.is_none());
+    assert!(!s.produced_by.face);
+}
+
+#[test]
+fn tuned_thresholds_load_from_a_partial_config_file() {
+    // Tuning loop ergonomics: change one number, rerun replay. If a tuning
+    // file had to restate the whole config, nobody would iterate.
+    let tuned = r#"
+[thresholds.pose]
+yaw_enter_deg = 30.0
+yaw_exit_deg = 22.0
+hold_ms = 1200
+"#;
+    let cfg: Config = toml::from_str(tuned).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.thresholds.pose.yaw_enter_deg, 30.0);
+    assert_eq!(cfg.thresholds.pose.hold_ms, 1200);
+    // Untouched signals keep their defaults.
+    assert_eq!(cfg.thresholds.face.no_face_hold_ms, 2500);
+    assert_eq!(cfg.cadence.face_hz, 15.0);
+}
+
+// TODO(step 8): replace the synthetic clip above with the recorded corpus and
+// assert violations, e.g.
+//
+//   let events = fusion::replay(&signals, &cfg);
+//   assert_violation(&events, ViolationKind::HeadTurnedAway, 1.6..2.4);
+//   assert_violation(&events, ViolationKind::ProhibitedObject, 3.9..4.3);
+//   assert_no_violations(&control_clip_events);
