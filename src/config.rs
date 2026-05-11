@@ -52,6 +52,11 @@ impl Config {
         check_hysteresis("pose.pitch", t.pose.pitch_enter_deg, t.pose.pitch_exit_deg)?;
         check_hysteresis("gaze.yaw", t.gaze.yaw_enter_rad, t.gaze.yaw_exit_rad)?;
         check_hysteresis("gaze.pitch", t.gaze.pitch_enter_rad, t.gaze.pitch_exit_rad)?;
+        check_hysteresis(
+            "debug_direction",
+            t.debug_direction.enter_deg,
+            t.debug_direction.exit_deg,
+        )?;
 
         // Identity runs the other way round: similarity *below* enter trips it.
         if t.identity.cosine_exit < t.identity.cosine_enter {
@@ -224,6 +229,32 @@ pub struct Thresholds {
     pub objects: ObjectThresholds,
     pub identity: IdentityThresholds,
     pub fusion: FusionWeights,
+    pub debug_direction: DebugDirectionThresholds,
+}
+
+/// Buckets for the temporary plain-language direction readout
+/// (see [`crate::direction`]).
+///
+/// Deliberately its own group rather than borrowed from `pose`/`gaze`: those
+/// thresholds decide *violations* and will be tuned against the clip corpus,
+/// while these only decide what a debug label says. Sharing them would mean
+/// tuning one silently changed the other, and would make this readout hard to
+/// delete when fusion replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugDirectionThresholds {
+    /// Degrees away from centre before a direction is claimed.
+    pub enter_deg: f64,
+    /// Degrees it must fall back through before the claim is released. Lower
+    /// than `enter_deg`, which is what stops the label flickering on the
+    /// boundary.
+    pub exit_deg: f64,
+}
+
+impl Default for DebugDirectionThresholds {
+    fn default() -> Self {
+        Self { enter_deg: 8.0, exit_deg: 5.0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

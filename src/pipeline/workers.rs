@@ -17,6 +17,7 @@ use crossbeam_channel::Sender;
 
 use crate::capture::FrameSource;
 use crate::config::Config;
+use crate::direction::DirectionTracker;
 use crate::models::face::YuNet;
 use crate::models::gaze::GazeNet;
 use crate::models::objects::YoloxNano;
@@ -95,6 +96,9 @@ pub(super) fn detect_loop(
     let mut last_seen = 0u64;
     let mut consecutive_failures = 0u32;
     let mut degraded = false;
+    // Hysteresis state for the debug direction readout. Owned by this thread
+    // because it is the only one that writes it, and updated in frame order.
+    let mut directions = DirectionTracker::new(&cfg.thresholds.debug_direction);
 
     loop {
         if shared.stop.load(Ordering::Relaxed) {
@@ -190,6 +194,9 @@ pub(super) fn detect_loop(
                             objects: objects_ran,
                             ..Default::default()
                         },
+                        // Bucketed here, on the same frame's angles, so the
+                        // label and the number beside it can never disagree.
+                        debug_directions: Some(directions.update(head_pose, gaze)),
                         ..Default::default()
                     };
 

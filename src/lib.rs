@@ -32,6 +32,7 @@
 
 pub mod capture;
 pub mod config;
+pub mod direction;
 pub mod error;
 pub mod models;
 pub mod pipeline;
@@ -40,6 +41,7 @@ pub mod types;
 
 pub use capture::{FrameSource, SourceSpec};
 pub use config::Config;
+pub use direction::{Axes, DebugDirections, DirectionTracker, FrameOfReference, Horizontal, Vertical};
 pub use error::{DetectError, Result};
 pub use pipeline::{Detected, Detector, DetectorBuilder};
 pub use report::{FrameStats, Latencies, LatencySummary, SessionReport, SignalStatus};

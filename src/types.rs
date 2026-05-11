@@ -120,7 +120,14 @@ pub struct FaceDetection {
 /// survives every smoke test and then quietly wrecks threshold tuning.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HeadPose {
-    /// Positive = turning to the subject's left as the camera sees it.
+    /// Positive = turned toward the **subject's own right**, which an
+    /// unmirrored camera draws on the *left* of the picture.
+    ///
+    /// Stated from the subject's side because "left" is meaningless otherwise,
+    /// and the two readings are opposites. The convention is not a choice made
+    /// here — it follows from the author's own `draw_axis`, which projects the
+    /// nose axis to `sin(-yaw_deg)`. See [`crate::direction`] for the full
+    /// derivation and the tests that pin it.
     pub yaw_deg: f32,
     /// Positive = looking up.
     pub pitch_deg: f32,
@@ -179,6 +186,14 @@ pub struct Signals {
     /// Which signal slots actually ran for this frame. A signal that is
     /// `None` because its model is degraded must not be read as "absent".
     pub produced_by: SignalCoverage,
+    /// Plain-language direction labels for the live HUD.
+    ///
+    /// **Temporary, and named to say so.** It rides along with the rest of the
+    /// signals rather than being derived by whoever draws them, so the labels
+    /// always describe the same frame as the angles printed beside them. When
+    /// fusion lands, its smoothed state replaces this and the field goes away
+    /// — see [`crate::direction`].
+    pub debug_directions: Option<crate::direction::DebugDirections>,
 }
 
 /// Per-frame record of which model slots were live. Distinguishes "the object
@@ -363,6 +378,15 @@ mod tests {
                 gaze: true,
                 ..Default::default()
             },
+            debug_directions: Some(crate::direction::DebugDirections {
+                head: Some(crate::direction::Axes {
+                    horizontal: crate::direction::Horizontal::Left,
+                    vertical: crate::direction::Vertical::Center,
+                }),
+                gaze: None,
+                eye: None,
+                frame_of_reference: crate::direction::FrameOfReference::Subject,
+            }),
         };
         let line = serde_json::to_string(&s).unwrap();
         assert_eq!(s, serde_json::from_str::<Signals>(&line).unwrap());

@@ -18,10 +18,23 @@ use deepscreen_detect::Config;
 /// A synthetic clip: someone looking progressively further left while a phone
 /// enters frame. Stands in for real footage until the corpus is recorded.
 fn synthetic_look_away_with_phone(frames: u64, fps: f32) -> Vec<Signals> {
+    // The same tracker the detect worker owns, driven over the same sweep, so
+    // the recording carries the labels a real session would rather than a stub
+    // that happens to serialize.
+    let mut directions =
+        deepscreen_detect::DirectionTracker::new(&Config::default().thresholds.debug_direction);
+
     (0..frames)
         .map(|seq| {
             let t_ms = (seq as f64 * 1000.0 / fps as f64).round() as u64;
             let yaw = -(seq as f32) * 1.5; // turning left over time
+            let head_pose = Some(HeadPose { yaw_deg: yaw, pitch_deg: 2.0, roll_deg: 0.5 });
+            let gaze = Some(Gaze {
+                pitch_rad: 0.05,
+                yaw_rad: yaw.to_radians() * 0.8,
+                eye_yaw_rad: None,
+                eye_pitch_rad: None,
+            });
             Signals {
                 seq,
                 t_ms,
@@ -30,13 +43,8 @@ fn synthetic_look_away_with_phone(frames: u64, fps: f32) -> Vec<Signals> {
                     score: 0.95,
                     keypoints: None,
                 }],
-                head_pose: Some(HeadPose { yaw_deg: yaw, pitch_deg: 2.0, roll_deg: 0.5 }),
-                gaze: Some(Gaze {
-                    pitch_rad: 0.05,
-                    yaw_rad: yaw.to_radians() * 0.8,
-                    eye_yaw_rad: None,
-                    eye_pitch_rad: None,
-                }),
+                head_pose,
+                gaze,
                 objects: if t_ms >= 2000 {
                     vec![ObjectDetection {
                         class_id: 67,
@@ -56,6 +64,7 @@ fn synthetic_look_away_with_phone(frames: u64, fps: f32) -> Vec<Signals> {
                     objects: t_ms >= 2000,
                     identity: seq % 75 == 0,
                 },
+                debug_directions: Some(directions.update(head_pose, gaze)),
             }
         })
         .collect()
@@ -104,6 +113,35 @@ fn coverage_distinguishes_absent_from_never_ran() {
     let late = signals.iter().find(|s| s.t_ms >= 2000).unwrap();
     assert!(late.produced_by.objects);
     assert_eq!(late.objects[0].label, "cell phone");
+}
+
+#[test]
+fn a_steady_turn_changes_its_label_exactly_once() {
+    // The property hysteresis exists to provide, over a realistic sweep rather
+    // than a hand-picked pair of numbers: the head turns steadily from square
+    // to well past the threshold, so the label must go CENTER -> LEFT and stay
+    // there. Any flapping around the boundary shows up as extra transitions.
+    use deepscreen_detect::Horizontal;
+
+    let signals = synthetic_look_away_with_phone(45, 15.0);
+    let labels: Vec<Horizontal> = signals
+        .iter()
+        .map(|s| s.debug_directions.unwrap().head.unwrap().horizontal)
+        .collect();
+
+    assert_eq!(labels.first(), Some(&Horizontal::Center), "starts square to the camera");
+    assert_eq!(labels.last(), Some(&Horizontal::Left), "ends well past the threshold");
+
+    let transitions = labels.windows(2).filter(|w| w[0] != w[1]).count();
+    assert_eq!(
+        transitions, 1,
+        "a monotonic turn should cross once; {transitions} crossings means the \
+         label is flapping on the boundary. Labels: {labels:?}"
+    );
+
+    // And the sign is the one the module documents: negative yaw is the
+    // subject's left. If this fails, the readout is mirrored.
+    assert!(signals.last().unwrap().head_pose.unwrap().yaw_deg < 0.0);
 }
 
 #[test]
