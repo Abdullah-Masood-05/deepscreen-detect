@@ -56,8 +56,28 @@ All figures on an Intel i7-11850H, CPU execution provider, release build.
 | Stage | p50 | p95 |
 |---|---|---|
 | Capture (1280×720 MJPEG) | 30.8 fps sustained | — |
-| Face + pose + gaze worker | 5.9 ms | 8.0 ms |
-| YOLOX-Nano (1 Hz worker) | 12.0 ms | 14.7 ms |
+| Face + pose + gaze worker | see note | see note |
+| YOLOX-Nano (1 Hz worker) | 11.6 ms | 12.8 ms |
+
+Per-model floors, synthetic input, 50 iterations after 5 warm-up:
+
+| Model | p50 | p95 |
+|---|---|---|
+| YuNet (fp32) | 4.7 ms | 6.0 ms |
+| Head pose | 1.5 ms | 2.1 ms |
+| Gaze | 9.5 ms | 10.6 ms |
+| YOLOX-Nano | 11.6 ms | 12.8 ms |
+
+> **Note on the combined worker figure.** An earlier 5.9 ms p50 was recorded
+> here for face + pose + gaze. It is wrong: those three models have floors
+> summing to 15.8 ms, so a worker running all three cannot be faster than that.
+> The gaze model's reliability gate was returning a held value with zeroed
+> timings, so gated frames contributed no latency while still reporting a gaze
+> value. A session with gaze demonstrably running measures ~23.5 ms p50.
+>
+> The gate is now explicit — a gated frame reports no gaze value and no timings
+> — but how often it fires in normal use has not yet been measured, so no
+> replacement number is quoted. Measuring it is the next piece of work.
 
 Capture and detection run on separate threads with latest-frame semantics, so
 detection running slower than capture drops frames rather than backing up the
