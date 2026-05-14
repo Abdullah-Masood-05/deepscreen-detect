@@ -12,6 +12,7 @@
 
 use deepscreen_detect::types::{
     BBox, EyeAspect, FaceDetection, Gaze, HeadPose, ObjectDetection, SignalCoverage, Signals,
+    SlotState,
 };
 use deepscreen_detect::Config;
 
@@ -58,11 +59,23 @@ fn synthetic_look_away_with_phone(frames: u64, fps: f32) -> Vec<Signals> {
                 identity_match: Some(0.68),
                 eye_aspect: Some(EyeAspect { left: 0.29, right: 0.30 }),
                 produced_by: SignalCoverage {
-                    face: true,
-                    pose: true,
-                    gaze: true,
-                    objects: t_ms >= 2000,
-                    identity: seq % 75 == 0,
+                    face: SlotState::Produced,
+                    pose: SlotState::Produced,
+                    gaze: SlotState::Produced,
+                    // Before the phone appears the object worker has run and
+                    // seen nothing; `Produced` with an empty list. That is the
+                    // distinction the old boolean could not express.
+                    objects: if t_ms >= 2000 {
+                        SlotState::Produced
+                    } else {
+                        SlotState::SkippedCadence
+                    },
+                    identity: if seq % 75 == 0 {
+                        SlotState::Produced
+                    } else {
+                        SlotState::SkippedCadence
+                    },
+                    gaze_gate: None,
                 },
                 debug_directions: Some(directions.update(head_pose, gaze)),
             }
@@ -108,11 +121,32 @@ fn coverage_distinguishes_absent_from_never_ran() {
 
     let early = &signals[0];
     assert!(early.objects.is_empty());
-    assert!(!early.produced_by.objects, "before 2s the object worker had not produced a result");
+    assert!(
+        !early.produced_by.objects.produced(),
+        "an empty list from a frame the object worker never touched is not \
+         evidence that nothing was there"
+    );
 
     let late = signals.iter().find(|s| s.t_ms >= 2000).unwrap();
-    assert!(late.produced_by.objects);
+    assert!(late.produced_by.objects.produced());
     assert_eq!(late.objects[0].label, "cell phone");
+}
+
+#[test]
+fn a_recording_survives_the_round_trip_with_slot_states_intact() {
+    // The states are the part fusion reads to decide whether a signal is
+    // absent or merely quiet, so they have to survive serialisation exactly.
+    // Long enough to cross the 2 s mark where the phone appears; a shorter
+    // clip is all cadence skips and would assert nothing.
+    let signals = synthetic_look_away_with_phone(45, 15.0);
+    let back = from_jsonl(&to_jsonl(&signals));
+    assert_eq!(signals, back);
+
+    let states: Vec<_> = back.iter().map(|s| s.produced_by.objects).collect();
+    assert!(
+        states.contains(&SlotState::SkippedCadence) && states.contains(&SlotState::Produced),
+        "the clip should exercise both a cadence skip and a real result"
+    );
 }
 
 #[test]
@@ -151,7 +185,7 @@ fn old_recordings_still_parse_after_signal_slots_are_added() {
     let s: Signals = serde_json::from_str(line).unwrap();
     assert_eq!(s.seq, 7);
     assert!(s.eye_aspect.is_none());
-    assert!(!s.produced_by.face);
+    assert_eq!(s.produced_by.face, SlotState::NotConfigured);
 }
 
 #[test]

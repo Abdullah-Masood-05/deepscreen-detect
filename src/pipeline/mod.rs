@@ -30,7 +30,9 @@ use crate::models::gaze::GazeNet;
 use crate::models::objects::YoloxNano;
 use crate::models::pose::HeadPoseNet;
 use crate::report::{FrameStats, Latencies, SessionReport, SignalStatus};
-use crate::types::{DegradeReason, DetectorState, Event, ObjectDetection, PipelineStats, Signals};
+use crate::types::{
+    DegradeReason, DetectorState, Event, ObjectDetection, PipelineStats, Signals, SlotState,
+};
 
 use frame_bus::FrameBus;
 
@@ -79,12 +81,25 @@ pub(crate) struct Shared {
 
     /// Newest object result, published by the object worker and read by the
     /// face worker when it assembles `Signals`. Lock-free on the read side.
-    objects: ArcSwap<Vec<ObjectDetection>>,
-    /// Whether the object detector has ever produced a result.
-    objects_ran: AtomicBool,
+    objects: ArcSwap<ObjectResult>,
 
     error: Mutex<Option<String>>,
     degraded: Mutex<Vec<DegradeReason>>,
+}
+
+/// One object-worker result, tagged with the frame it was computed on.
+///
+/// The sequence number is what makes per-frame coverage possible: the face
+/// worker can tell a result it has not seen before from one it already
+/// attached to an earlier frame.
+#[derive(Default)]
+pub(crate) struct ObjectResult {
+    detections: Vec<ObjectDetection>,
+    /// Frame the detections were computed on. `0` = nothing yet.
+    seq: u64,
+    /// `Produced` once a run succeeds, `Failed` after an error,
+    /// `NotConfigured` while no object model is loaded.
+    state: SlotState,
 }
 
 impl Shared {
@@ -103,24 +118,61 @@ impl Shared {
             detect_latency: Mutex::new(Latencies::rolling(LATENCY_WINDOW)),
             total_latency: Mutex::new(Latencies::rolling(LATENCY_WINDOW)),
             object_latency: Mutex::new(Latencies::rolling(LATENCY_WINDOW)),
-            objects: ArcSwap::from_pointee(Vec::new()),
-            objects_ran: AtomicBool::new(false),
+            objects: ArcSwap::from_pointee(ObjectResult::default()),
             error: Mutex::new(None),
             degraded: Mutex::new(Vec::new()),
         }
     }
 
-    fn publish_objects(&self, objects: Vec<ObjectDetection>, seq: u64) {
-        if !objects.is_empty() {
-            tracing::debug!(seq, count = objects.len(), "objects detected");
-        }
-        self.objects.store(Arc::new(objects));
-        self.objects_ran.store(true, Ordering::Relaxed);
+    /// Mark the object slot as configured but not yet run, so a frame before
+    /// the worker's first result reads as a cadence skip rather than as "no
+    /// model loaded".
+    fn arm_objects(&self) {
+        self.objects.store(Arc::new(ObjectResult {
+            state: SlotState::SkippedCadence,
+            ..Default::default()
+        }));
     }
 
-    fn latest_objects(&self) -> (Vec<ObjectDetection>, bool) {
-        let ran = self.objects_ran.load(Ordering::Relaxed);
-        ((**self.objects.load()).clone(), ran)
+    fn publish_objects(&self, detections: Vec<ObjectDetection>, seq: u64) {
+        if !detections.is_empty() {
+            tracing::debug!(seq, count = detections.len(), "objects detected");
+        }
+        self.objects.store(Arc::new(ObjectResult {
+            detections,
+            seq,
+            state: SlotState::Produced,
+        }));
+    }
+
+    fn publish_object_failure(&self, seq: u64) {
+        self.objects.store(Arc::new(ObjectResult {
+            detections: Vec::new(),
+            seq,
+            state: SlotState::Failed,
+        }));
+    }
+
+    /// Hand the newest unseen object result to the face worker, exactly once.
+    ///
+    /// The two workers run on independent cursors over the frame bus, so they
+    /// rarely land on the same frame — requiring an exact sequence match would
+    /// throw nearly every object result away. Instead each result is attached
+    /// to the first face frame that follows it and is then consumed, so it is
+    /// reported once and never carried forward.
+    ///
+    /// Every later frame reports `SkippedCadence` with an empty list: no new
+    /// measurement, and explicitly not evidence that nothing is there.
+    fn take_new_objects(&self, cursor: &mut u64) -> (Vec<ObjectDetection>, SlotState) {
+        let result = self.objects.load();
+        match result.state {
+            SlotState::NotConfigured => (Vec::new(), SlotState::NotConfigured),
+            _ if result.seq == 0 || result.seq <= *cursor => (Vec::new(), SlotState::SkippedCadence),
+            state => {
+                *cursor = result.seq;
+                (result.detections.clone(), state)
+            }
+        }
     }
 
     fn note_degraded(&self, reason: DegradeReason) {
@@ -272,6 +324,9 @@ impl Detector {
             Some(path) => match YoloxNano::load(&path, &self.config) {
                 Ok(model) => {
                     tracing::info!(model = %path.display(), "object model ready");
+                    // Configured but not yet run: frames before the first
+                    // result are cadence skips, not a missing model.
+                    self.shared.arm_objects();
                     Some(model)
                 }
                 Err(e) => {
@@ -401,9 +456,12 @@ impl Detector {
         signals.insert(
             "objects".to_string(),
             SignalStatus {
-                active: self.shared.objects_ran.load(Ordering::Relaxed),
-                active_fraction: if self.shared.objects_ran.load(Ordering::Relaxed) {
-                    1.0
+                // Sampled from the worker's own latency histogram rather than
+                // a "has ever run" flag: a slot that ran once an hour ago and
+                // a slot running at cadence are not equally alive.
+                active: object_latency.samples > 0,
+                active_fraction: if stats.frames_captured > 0 {
+                    object_latency.samples as f32 / stats.frames_captured as f32
                 } else {
                     0.0
                 },

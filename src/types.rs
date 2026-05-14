@@ -179,6 +179,10 @@ pub struct Signals {
     pub faces: Vec<FaceDetection>,
     pub head_pose: Option<HeadPose>,
     pub gaze: Option<Gaze>,
+    /// Only populated on frames where `produced_by.objects` is
+    /// [`SlotState::Produced`]. Empty otherwise — an object result is never
+    /// carried forward onto a later frame, because "there was a phone 900 ms
+    /// ago" is an inference and inference belongs to fusion, not here.
     pub objects: Vec<ObjectDetection>,
     /// Cosine similarity against the enrolled embedding.
     pub identity_match: Option<f32>,
@@ -196,17 +200,103 @@ pub struct Signals {
     pub debug_directions: Option<crate::direction::DebugDirections>,
 }
 
-/// Per-frame record of which model slots were live. Distinguishes "the object
-/// detector saw nothing" from "the object detector was never running"
-/// (MODELS.md §8).
+/// What one model slot did on one frame.
+///
+/// A boolean could only say "ran" or "didn't", and the interesting cases all
+/// live inside "didn't". Fusion has to tell an expected skip from a failure
+/// from a model that was never loaded, because reading an absent signal as a
+/// benign one is a false-negative generator — the worst failure mode a
+/// proctoring system has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotState {
+    /// Ran on this frame. Its value in [`Signals`] is a measurement — including
+    /// when that measurement is "nothing there".
+    Produced,
+    /// Deliberately not run: the input did not meet the model's entry
+    /// conditions. A blink, a half-turned head, or no face to crop from.
+    /// Expected, and not a fault.
+    SkippedGated,
+    /// Runs slower than the face worker and had no new result for this frame.
+    /// Expected: the object worker is 1 Hz against a 15 Hz face worker.
+    SkippedCadence,
+    /// The model was loaded and erred on this frame. Degraded.
+    Failed,
+    /// No model in this slot. The signal is unavailable for the whole session,
+    /// not absent on this frame.
+    #[default]
+    NotConfigured,
+}
+
+impl SlotState {
+    /// True only for [`Self::Produced`]. Anything else means the matching field
+    /// in [`Signals`] carries no measurement.
+    pub fn produced(self) -> bool {
+        matches!(self, Self::Produced)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Produced => "produced",
+            Self::SkippedGated => "gated",
+            Self::SkippedCadence => "cadence",
+            Self::Failed => "failed",
+            Self::NotConfigured => "absent",
+        }
+    }
+}
+
+/// Why the gaze model declined to run.
+///
+/// Carried per-frame so the skip rate can be attributed rather than guessed.
+/// A gate that fires constantly for one reason is a threshold problem; one
+/// that fires evenly across reasons is a framing problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    /// No face detected on this frame, so there was nothing to crop.
+    NoFace,
+    /// The detector was barely holding the face.
+    LowFaceScore,
+    /// Eye keypoints collapsed together — a blink, motion blur, or a profile.
+    EyesTooClose,
+    /// Eye keypoints implausibly far apart for the box; the keypoints are not
+    /// describing a forward-facing face.
+    EyesTooFar,
+    /// Degenerate face box, so the ratio test could not be computed.
+    DegenerateBox,
+}
+
+impl GateReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoFace => "no_face",
+            Self::LowFaceScore => "low_face_score",
+            Self::EyesTooClose => "eyes_too_close",
+            Self::EyesTooFar => "eyes_too_far",
+            Self::DegenerateBox => "degenerate_box",
+        }
+    }
+}
+
+/// Per-frame record of what each model slot did.
+///
+/// **Per frame, not per session.** The previous version was a set of booleans
+/// where `objects` was a sticky global meaning "has ever run", so a frame the
+/// object worker never touched was indistinguishable from one where it looked
+/// and found nothing. That is precisely the ambiguity this type exists to
+/// remove, and it did not remove it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SignalCoverage {
-    pub face: bool,
-    pub pose: bool,
-    pub gaze: bool,
-    pub objects: bool,
-    pub identity: bool,
+    pub face: SlotState,
+    pub pose: SlotState,
+    pub gaze: SlotState,
+    pub objects: SlotState,
+    pub identity: SlotState,
+    /// Set when `gaze` is [`SlotState::SkippedGated`], so the skip rate can be
+    /// broken down by cause.
+    pub gaze_gate: Option<GateReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -373,9 +463,10 @@ mod tests {
             identity_match: Some(0.61),
             eye_aspect: Some(EyeAspect { left: 0.28, right: 0.30 }),
             produced_by: SignalCoverage {
-                face: true,
-                pose: true,
-                gaze: true,
+                face: SlotState::Produced,
+                pose: SlotState::Produced,
+                gaze: SlotState::SkippedGated,
+                gaze_gate: Some(GateReason::EyesTooClose),
                 ..Default::default()
             },
             debug_directions: Some(crate::direction::DebugDirections {
@@ -399,7 +490,33 @@ mod tests {
         let s: Signals = serde_json::from_str(r#"{"seq":1,"t_ms":66}"#).unwrap();
         assert_eq!(s.seq, 1);
         assert!(s.faces.is_empty());
-        assert!(!s.produced_by.objects);
+        // The default is `NotConfigured`, not `Produced`: a recording that
+        // says nothing about a slot must not be read as that slot having run.
+        assert_eq!(s.produced_by.objects, SlotState::NotConfigured);
+        assert!(!s.produced_by.objects.produced());
+    }
+
+    #[test]
+    fn an_empty_object_list_is_only_a_measurement_when_the_slot_produced() {
+        // The whole point of the type. Both frames below carry
+        // `objects: []`, and they mean opposite things.
+        let looked_and_saw_nothing = Signals {
+            produced_by: SignalCoverage { objects: SlotState::Produced, ..Default::default() },
+            ..Default::default()
+        };
+        let never_ran = Signals {
+            produced_by: SignalCoverage {
+                objects: SlotState::SkippedCadence,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(looked_and_saw_nothing.objects, never_ran.objects);
+        assert!(looked_and_saw_nothing.produced_by.objects.produced());
+        assert!(
+            !never_ran.produced_by.objects.produced(),
+            "a cadence skip must never read as evidence of absence"
+        );
     }
 
     #[test]

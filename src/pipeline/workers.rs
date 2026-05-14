@@ -19,10 +19,10 @@ use crate::capture::FrameSource;
 use crate::config::Config;
 use crate::direction::DirectionTracker;
 use crate::models::face::YuNet;
-use crate::models::gaze::GazeNet;
+use crate::models::gaze::{GazeNet, GazeOutcome};
 use crate::models::objects::YoloxNano;
 use crate::models::pose::HeadPoseNet;
-use crate::types::{DegradeReason, Event, SignalCoverage, Signals};
+use crate::types::{DegradeReason, Event, GateReason, SignalCoverage, Signals, SlotState};
 
 use super::{Detected, Shared};
 
@@ -99,6 +99,8 @@ pub(super) fn detect_loop(
     // Hysteresis state for the debug direction readout. Owned by this thread
     // because it is the only one that writes it, and updated in frame order.
     let mut directions = DirectionTracker::new(&cfg.thresholds.debug_direction);
+    // Cursor over object results, so each is reported on exactly one frame.
+    let mut last_object_seq = 0u64;
 
     loop {
         if shared.stop.load(Ordering::Relaxed) {
@@ -132,14 +134,20 @@ pub(super) fn detect_loop(
                     // two people in frame, pose describes the candidate, not
                     // whoever wandered past behind them.
                     let mut head_pose = None;
-                    let mut pose_ran = false;
+                    // `NotConfigured` unless a model exists; a face-less frame
+                    // is a gated skip, because there was nothing to crop from.
+                    let mut pose_state = match models.pose {
+                        Some(_) if faces.is_empty() => SlotState::SkippedGated,
+                        Some(_) => SlotState::NotConfigured,
+                        None => SlotState::NotConfigured,
+                    };
                     if let (Some(pose_model), Some(primary)) =
                         (models.pose.as_mut(), faces.first())
                     {
                         match pose_model.estimate(&frame, primary) {
                             Ok((p, pose_timings)) => {
                                 head_pose = Some(p);
-                                pose_ran = true;
+                                pose_state = SlotState::Produced;
                                 timings.preprocess_us += pose_timings.preprocess_us;
                                 timings.inference_us += pose_timings.inference_us;
                                 timings.postprocess_us += pose_timings.postprocess_us;
@@ -148,6 +156,7 @@ pub(super) fn detect_loop(
                                 // Losing pose is a degraded capability, not a
                                 // dead session — the face signal is unaffected.
                                 tracing::warn!(error = %e, "head pose failed");
+                                pose_state = SlotState::Failed;
                             }
                         }
                     }
@@ -157,28 +166,42 @@ pub(super) fn detect_loop(
                     // measurements of the same instant rather than of two
                     // things that happened to be nearby in time.
                     let mut gaze = None;
-                    let mut gaze_ran = false;
+                    let mut gaze_state = SlotState::NotConfigured;
+                    let mut gaze_gate = None;
+                    if models.gaze.is_some() && faces.is_empty() {
+                        gaze_state = SlotState::SkippedGated;
+                        gaze_gate = Some(GateReason::NoFace);
+                    }
                     if let (Some(gaze_model), Some(primary)) =
                         (models.gaze.as_mut(), faces.first())
                     {
                         match gaze_model.estimate(&frame, primary, head_pose) {
-                            Ok((g, gaze_timings)) => {
+                            Ok(GazeOutcome::Produced { gaze: g, timings: gaze_timings }) => {
                                 gaze = Some(g);
-                                gaze_ran = true;
+                                gaze_state = SlotState::Produced;
                                 timings.preprocess_us += gaze_timings.preprocess_us;
                                 timings.inference_us += gaze_timings.inference_us;
                                 timings.postprocess_us += gaze_timings.postprocess_us;
                             }
-                            Err(e) => tracing::warn!(error = %e, "gaze failed"),
+                            // Gated: no value and no timings. Nothing is added
+                            // to `timings`, so a skipped frame cannot read as a
+                            // frame where gaze ran unusually fast.
+                            Ok(GazeOutcome::Gated(reason)) => {
+                                gaze_state = SlotState::SkippedGated;
+                                gaze_gate = Some(reason);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "gaze failed");
+                                gaze_state = SlotState::Failed;
+                            }
                         }
                     }
 
-                    // Objects run on their own thread at their own rate, so
-                    // the newest available result is attached to this frame's
-                    // signals. `produced_by.objects` records whether the
-                    // detector has ever run, which is what distinguishes
-                    // "saw nothing" from "was not running" (MODELS.md §8).
-                    let (objects, objects_ran) = shared.latest_objects();
+                    // Objects run on their own thread at their own rate. Each
+                    // result is attached to the first face frame after it and
+                    // consumed; later frames get an empty list and
+                    // `SkippedCadence`, never a carried-forward value.
+                    let (objects, objects_state) = shared.take_new_objects(&mut last_object_seq);
 
                     let signals = Signals {
                         seq: frame.seq,
@@ -186,13 +209,14 @@ pub(super) fn detect_loop(
                         faces,
                         head_pose,
                         gaze,
-                        objects: objects.clone(),
+                        objects,
                         produced_by: SignalCoverage {
-                            face: true,
-                            pose: pose_ran,
-                            gaze: gaze_ran,
-                            objects: objects_ran,
-                            ..Default::default()
+                            face: SlotState::Produced,
+                            pose: pose_state,
+                            gaze: gaze_state,
+                            objects: objects_state,
+                            identity: SlotState::NotConfigured,
+                            gaze_gate,
                         },
                         // Bucketed here, on the same frame's angles, so the
                         // label and the number beside it can never disagree.
@@ -275,7 +299,13 @@ pub(super) fn object_loop(mut model: YoloxNano, cfg: Config, shared: Arc<Shared>
                         lat.record_us(timings.inference_us as u64);
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, "object detection failed"),
+                Err(e) => {
+                    // Published as a failure rather than dropped, so the face
+                    // worker reports `Failed` for one frame instead of the
+                    // silence that a cadence skip looks like.
+                    tracing::warn!(error = %e, "object detection failed");
+                    shared.publish_object_failure(frame.seq);
+                }
             }
         }
 

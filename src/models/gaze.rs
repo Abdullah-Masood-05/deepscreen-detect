@@ -36,7 +36,7 @@ use ort::session::Session;
 
 use crate::config::Config;
 use crate::error::{DetectError, Result};
-use crate::types::{FaceDetection, Frame, Gaze, HeadPose};
+use crate::types::{FaceDetection, Frame, GateReason, Gaze, HeadPose};
 
 use super::{build_session, inference_error, nchw_input, StageTimings};
 
@@ -49,13 +49,25 @@ const ANGLE_OFFSET_DEG: f32 = 180.0;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
+/// What one call to [`GazeNet::estimate`] did.
+///
+/// Replaces returning a held previous value with zeroed timings. That was
+/// wrong twice over: the caller could not tell a fresh measurement from a
+/// stale one, and the zeroed timings made a skipped frame look like a frame
+/// where gaze ran in no time at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GazeOutcome {
+    Produced { gaze: Gaze, timings: StageTimings },
+    /// Not run, and why. There is no gaze value at all — not a stale one, and
+    /// not a zero, which would read as "looking straight ahead".
+    Gated(GateReason),
+}
+
 pub struct GazeNet {
     session: Session,
     resizer: Resizer,
     scaled: Image<'static>,
     tensor: Vec<f32>,
-    /// Last good value, held through frames where the face is unreliable.
-    last_good: Option<(f32, f32)>,
     min_face_score: f32,
 }
 
@@ -69,7 +81,6 @@ impl GazeNet {
             resizer: Resizer::new(),
             scaled: Image::new(INPUT_SIZE, INPUT_SIZE, PixelType::U8x3),
             tensor: vec![0.0; 3 * side * side],
-            last_good: None,
             min_face_score: cfg.thresholds.gaze.min_face_score as f32,
         };
         model.warm_up(cfg.runtime.warmup_iters)?;
@@ -93,13 +104,12 @@ impl GazeNet {
         frame: &Frame,
         face: &FaceDetection,
         head_pose: Option<HeadPose>,
-    ) -> Result<(Gaze, StageTimings)> {
+    ) -> Result<GazeOutcome> {
         // Gaze during a blink, or off a face the detector is barely holding
         // on to, is not a measurement — it is noise that looks like a
-        // measurement. Hold the previous value rather than emitting it.
-        if !self.face_is_reliable(face) {
-            let (yaw, pitch) = self.last_good.unwrap_or((0.0, 0.0));
-            return Ok((assemble(yaw, pitch, head_pose), StageTimings::default()));
+        // measurement. Say so, rather than emitting anything.
+        if let Some(reason) = self.gate_reason(face) {
+            return Ok(GazeOutcome::Gated(reason));
         }
 
         let t0 = std::time::Instant::now();
@@ -118,16 +128,15 @@ impl GazeNet {
         let yaw_deg = decode_bins(extract(&outputs, "yaw")?);
         let pitch_deg = decode_bins(extract(&outputs, "pitch")?);
         let (yaw, pitch) = (yaw_deg.to_radians(), pitch_deg.to_radians());
-        self.last_good = Some((yaw, pitch));
 
-        Ok((
-            assemble(yaw, pitch, head_pose),
-            StageTimings {
+        Ok(GazeOutcome::Produced {
+            gaze: assemble(yaw, pitch, head_pose),
+            timings: StageTimings {
                 preprocess_us,
                 inference_us,
                 postprocess_us: t2.elapsed().as_micros() as u32,
             },
-        ))
+        })
     }
 
     /// A coarse gate, deliberately.
@@ -138,21 +147,9 @@ impl GazeNet {
     /// detector losing confidence or the eye keypoints collapsing, which is
     /// what a blink, motion blur and a half-turned head all look like from
     /// here. Documented as a proxy so nobody later reads it as more than it is.
-    fn face_is_reliable(&self, face: &FaceDetection) -> bool {
-        if face.score < self.min_face_score {
-            return false;
-        }
-        let Some(k) = face.keypoints else { return true };
-        let dx = k.left_eye.0 - k.right_eye.0;
-        let dy = k.left_eye.1 - k.right_eye.1;
-        let inter_eye = (dx * dx + dy * dy).sqrt();
-        if face.bbox.w <= 0.0 {
-            return false;
-        }
-        // Eyes sit at roughly a quarter to a half of face width apart. Outside
-        // that band the keypoints are not describing a forward-facing face.
-        let ratio = inter_eye / face.bbox.w;
-        (0.15..=0.75).contains(&ratio)
+    /// `None` means run it. `Some(reason)` means don't.
+    pub fn gate_reason(&self, face: &FaceDetection) -> Option<GateReason> {
+        gate_reason(face, self.min_face_score)
     }
 
     /// The reference feeds the detector's face box directly, with no
@@ -187,6 +184,46 @@ impl GazeNet {
             }
         }
         Ok(())
+    }
+}
+
+/// Should gaze run on this face?
+///
+/// `None` means run it. `Some(reason)` means don't, and says which test failed
+/// — the breakdown is what turns a bare skip rate into a diagnosis.
+///
+/// A free function so it is testable without a loaded ONNX session. The
+/// previous test reimplemented this logic inline and therefore proved only
+/// that the test agreed with itself.
+///
+/// **This is not a blink detector.** A real eye-aspect-ratio needs eyelid
+/// landmarks, and YuNet gives five points with no eyelids — so a genuine EAR
+/// is not available from this model set. What this catches is the detector
+/// losing confidence or the eye keypoints collapsing, which is what a blink,
+/// motion blur and a half-turned head all look like from here. Documented as a
+/// proxy so nobody later reads it as more than it is.
+pub fn gate_reason(face: &FaceDetection, min_face_score: f32) -> Option<GateReason> {
+    if face.score < min_face_score {
+        return Some(GateReason::LowFaceScore);
+    }
+    // Without keypoints the ratio test cannot run, so gaze goes ahead. The `?`
+    // returns "no gate reason", which is the permissive answer here.
+    let k = face.keypoints?;
+    let dx = k.left_eye.0 - k.right_eye.0;
+    let dy = k.left_eye.1 - k.right_eye.1;
+    let inter_eye = (dx * dx + dy * dy).sqrt();
+    if face.bbox.w <= 0.0 {
+        return Some(GateReason::DegenerateBox);
+    }
+    // Eyes sit at roughly a quarter to a half of face width apart. Outside
+    // that band the keypoints are not describing a forward-facing face.
+    let ratio = inter_eye / face.bbox.w;
+    if ratio < 0.15 {
+        Some(GateReason::EyesTooClose)
+    } else if ratio > 0.75 {
+        Some(GateReason::EyesTooFar)
+    } else {
+        None
     }
 }
 
@@ -309,20 +346,42 @@ mod tests {
 
     #[test]
     fn the_reliability_gate_rejects_low_scores_and_collapsed_eyes() {
-        let cfg = Config::default();
-        let min = cfg.thresholds.gaze.min_face_score as f32;
+        let min = Config::default().thresholds.gaze.min_face_score as f32;
 
-        let net_ok = |f: &FaceDetection| {
-            f.score >= min && {
-                let k = f.keypoints.unwrap();
-                let d = k.left_eye.0 - k.right_eye.0;
-                let r = d / f.bbox.w;
-                (0.15..=0.75).contains(&r)
-            }
-        };
+        assert_eq!(gate_reason(&face(0.95, 40.0, 100.0), min), None, "a normal face should pass");
+        assert_eq!(
+            gate_reason(&face(0.10, 40.0, 100.0), min),
+            Some(GateReason::LowFaceScore),
+            "a barely-held face should not"
+        );
+        assert_eq!(
+            gate_reason(&face(0.95, 2.0, 100.0), min),
+            Some(GateReason::EyesTooClose),
+            "collapsed eye keypoints should not"
+        );
+        assert_eq!(
+            gate_reason(&face(0.95, 90.0, 100.0), min),
+            Some(GateReason::EyesTooFar),
+            "eyes wider apart than the face is not a forward-facing face"
+        );
+    }
 
-        assert!(net_ok(&face(0.95, 40.0, 100.0)), "a normal face should pass");
-        assert!(!net_ok(&face(0.10, 40.0, 100.0)), "a barely-held face should not");
-        assert!(!net_ok(&face(0.95, 2.0, 100.0)), "collapsed eye keypoints should not");
+    #[test]
+    fn each_gate_reason_is_reachable_and_distinct() {
+        // A breakdown is only useful if the causes can actually be told apart.
+        // If two tests collapsed onto one reason, the C1 diagnostic would
+        // report a cause that never fires and hide one that does.
+        let min = Config::default().thresholds.gaze.min_face_score as f32;
+        let mut degenerate = face(0.95, 40.0, 100.0);
+        degenerate.bbox.w = 0.0;
+
+        let reasons = [
+            gate_reason(&face(0.10, 40.0, 100.0), min),
+            gate_reason(&face(0.95, 2.0, 100.0), min),
+            gate_reason(&face(0.95, 90.0, 100.0), min),
+            gate_reason(&degenerate, min),
+        ];
+        let distinct: std::collections::HashSet<_> = reasons.iter().collect();
+        assert_eq!(distinct.len(), 4, "reasons collapsed: {reasons:?}");
     }
 }

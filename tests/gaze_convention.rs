@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use deepscreen_detect::config::Config;
 use deepscreen_detect::models::face::YuNet;
-use deepscreen_detect::models::gaze::GazeNet;
+use deepscreen_detect::models::gaze::{GazeNet, GazeOutcome};
 use deepscreen_detect::models::pose::HeadPoseNet;
 use deepscreen_detect::types::Frame;
 
@@ -109,7 +109,12 @@ fn measure(m: &mut Models, frame: &Frame) -> Option<(f32, f32)> {
     let faces = m.face.detect(frame).ok()?;
     let primary = faces.first()?;
     let (pose, _) = m.pose.estimate(frame, primary).ok()?;
-    let (gaze, _) = m.gaze.estimate(frame, primary, Some(pose)).ok()?;
+    // A gated frame yields no measurement at all, which is the point: pairing
+    // a head angle with a held-over gaze angle would compare two instants.
+    let GazeOutcome::Produced { gaze, .. } = m.gaze.estimate(frame, primary, Some(pose)).ok()?
+    else {
+        return None;
+    };
     Some((pose.yaw_deg, gaze.yaw_rad.to_degrees()))
 }
 

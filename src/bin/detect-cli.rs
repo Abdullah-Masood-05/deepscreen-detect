@@ -30,7 +30,10 @@ use deepscreen_detect::models::objects::YoloxNano;
 use deepscreen_detect::models::pose::HeadPoseNet;
 use deepscreen_detect::error::{DetectError, Result};
 use deepscreen_detect::report::Latencies;
-use deepscreen_detect::types::{FaceDetection, SignalCoverage, Signals};
+use std::collections::BTreeMap;
+
+use deepscreen_detect::models::gaze::GazeOutcome;
+use deepscreen_detect::types::{FaceDetection, GateReason, SignalCoverage, Signals, SlotState};
 use deepscreen_detect::{Detector, SourceSpec};
 
 #[derive(Parser, Debug)]
@@ -500,26 +503,71 @@ fn cmd_record(cfg: &Config, source: &str, out: &PathBuf, max_frames: Option<u64>
     while let Some(frame) = src.next_frame()? {
         let faces = face.detect(&frame)?;
 
+        let mut pose_state = SlotState::NotConfigured;
         let head_pose = match (pose.as_mut(), faces.first()) {
-            (Some(model), Some(primary)) => model.estimate(&frame, primary).ok().map(|(p, _)| p),
-            _ => None,
-        };
-        let gaze_signal = match (gaze.as_mut(), faces.first()) {
-            (Some(model), Some(primary)) => {
-                model.estimate(&frame, primary, head_pose).ok().map(|(g, _)| g)
+            (Some(model), Some(primary)) => match model.estimate(&frame, primary) {
+                Ok((p, _)) => {
+                    pose_state = SlotState::Produced;
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "head pose failed");
+                    pose_state = SlotState::Failed;
+                    None
+                }
+            },
+            (Some(_), None) => {
+                pose_state = SlotState::SkippedGated;
+                None
             }
             _ => None,
         };
 
-        let (detected_objects, objects_ran) = match objects.as_mut() {
+        let mut gaze_state = SlotState::NotConfigured;
+        let mut gaze_gate = None;
+        let gaze_signal = match (gaze.as_mut(), faces.first()) {
+            (Some(model), Some(primary)) => {
+                match model.estimate(&frame, primary, head_pose) {
+                    Ok(GazeOutcome::Produced { gaze: g, .. }) => {
+                        gaze_state = SlotState::Produced;
+                        Some(g)
+                    }
+                    Ok(GazeOutcome::Gated(reason)) => {
+                        gaze_state = SlotState::SkippedGated;
+                        gaze_gate = Some(reason);
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "gaze failed");
+                        gaze_state = SlotState::Failed;
+                        None
+                    }
+                }
+            }
+            (Some(_), None) => {
+                gaze_state = SlotState::SkippedGated;
+                gaze_gate = Some(GateReason::NoFace);
+                None
+            }
+            _ => None,
+        };
+
+        // `record` runs every model on every frame, so objects never skip for
+        // cadence here — that is the whole point of the command.
+        let mut objects_state = SlotState::NotConfigured;
+        let detected_objects = match objects.as_mut() {
             Some(model) => match model.detect(&frame) {
-                Ok((o, _)) => (o, true),
+                Ok((o, _)) => {
+                    objects_state = SlotState::Produced;
+                    o
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "object detection failed");
-                    (Vec::new(), false)
+                    objects_state = SlotState::Failed;
+                    Vec::new()
                 }
             },
-            None => (Vec::new(), false),
+            None => Vec::new(),
         };
 
         let signals = Signals {
@@ -532,11 +580,12 @@ fn cmd_record(cfg: &Config, source: &str, out: &PathBuf, max_frames: Option<u64>
             gaze: gaze_signal,
             objects: detected_objects,
             produced_by: SignalCoverage {
-                face: true,
-                pose: head_pose.is_some(),
-                gaze: gaze_signal.is_some(),
-                objects: objects_ran,
-                ..Default::default()
+                face: SlotState::Produced,
+                pose: pose_state,
+                gaze: gaze_state,
+                objects: objects_state,
+                identity: SlotState::NotConfigured,
+                gaze_gate,
             },
             ..Default::default()
         };
@@ -722,7 +771,12 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
     let mut objects = 0u64;
     let mut first_t = None;
     let mut last_t = 0u64;
-    let mut coverage = SignalCoverage::default();
+    // Per-slot tallies, keyed by state. A slot that "ever ran" says nothing
+    // useful; what matters is the proportion of frames each state accounts for,
+    // and for gaze, which gate condition caused each skip.
+    let mut slots: BTreeMap<&'static str, BTreeMap<&'static str, u64>> = BTreeMap::new();
+    let mut gates: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut frames_with_face = 0u64;
 
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -740,21 +794,60 @@ fn cmd_replay(path: &PathBuf, expect: &[String]) -> Result<()> {
         objects += s.objects.len() as u64;
         first_t.get_or_insert(s.t_ms);
         last_t = s.t_ms;
-        coverage.face |= s.produced_by.face;
-        coverage.pose |= s.produced_by.pose;
-        coverage.gaze |= s.produced_by.gaze;
-        coverage.objects |= s.produced_by.objects;
-        coverage.identity |= s.produced_by.identity;
+        if !s.faces.is_empty() {
+            frames_with_face += 1;
+        }
+        let c = &s.produced_by;
+        for (slot, state) in [
+            ("face", c.face),
+            ("pose", c.pose),
+            ("gaze", c.gaze),
+            ("objects", c.objects),
+            ("identity", c.identity),
+        ] {
+            *slots.entry(slot).or_default().entry(state.as_str()).or_default() += 1;
+        }
+        if let Some(reason) = c.gaze_gate {
+            *gates.entry(reason.as_str()).or_default() += 1;
+        }
     }
 
     let span_ms = last_t.saturating_sub(first_t.unwrap_or(0));
     println!("{count} Signals over {:.2}s", span_ms as f32 / 1000.0);
     println!("  face detections: {faces}");
     println!("  object detections: {objects}");
-    println!(
-        "  slots that ever ran: face={} pose={} gaze={} objects={} identity={}",
-        coverage.face, coverage.pose, coverage.gaze, coverage.objects, coverage.identity
-    );
+    println!("  frames with a face: {frames_with_face} of {count}");
+
+    println!("\n  per-slot state, frames (share of all frames):");
+    for (slot, states) in &slots {
+        let parts: Vec<String> = states
+            .iter()
+            .map(|(state, n)| {
+                format!("{state}={n} ({:.0}%)", 100.0 * *n as f32 / count.max(1) as f32)
+            })
+            .collect();
+        println!("    {slot:<9} {}", parts.join("  "));
+    }
+
+    // The number that decides whether the gate is doing its job or eating the
+    // signal. Denominated in frames that had a face, because a frame with no
+    // face was never a candidate for gaze in the first place.
+    if let Some(gaze_states) = slots.get("gaze") {
+        let produced = gaze_states.get("produced").copied().unwrap_or(0);
+        if frames_with_face > 0 {
+            println!(
+                "\n  gaze ran on {produced} of {frames_with_face} frames with a face ({:.1}%)",
+                100.0 * produced as f32 / frames_with_face as f32
+            );
+        }
+    }
+    if !gates.is_empty() {
+        println!("  gate reasons:");
+        let total: u64 = gates.values().sum();
+        for (reason, n) in &gates {
+            println!("    {reason:<16} {n} ({:.1}%)", 100.0 * *n as f32 / total as f32);
+        }
+    }
 
     if !expect.is_empty() {
         return Err(DetectError::Config(

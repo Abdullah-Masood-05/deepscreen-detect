@@ -47,12 +47,19 @@ pub use pipeline::{Detected, Detector, DetectorBuilder};
 pub use report::{FrameStats, Latencies, LatencySummary, SessionReport, SignalStatus};
 pub use types::{
     BBox, Contribution, DegradeReason, DetectorState, Event, EyeAspect, FaceDetection,
-    FaceKeypoints, Frame, Gaze, HeadPose, ObjectDetection, Severity, SignalCoverage, SignalSource,
-    Signals, Violation, ViolationKind,
+    FaceKeypoints, Frame, GateReason, Gaze, HeadPose, ObjectDetection, Severity, SignalCoverage,
+    SignalSource, Signals, SlotState, Violation, ViolationKind,
 };
 
 /// Version of the `Signals` JSONL format. Bump when a change would make an
 /// old recording replay to different violations — recordings are the
 /// regression corpus, and silently reinterpreting them would be worse than
 /// refusing to read them.
-pub const SIGNALS_FORMAT_VERSION: u32 = 1;
+///
+/// **2**: `SignalCoverage` went from five booleans to five [`SlotState`]s.
+/// A v1 recording says `"face": true`, which will not deserialise, so old
+/// recordings are refused rather than half-read. That is the intent: `true`
+/// could not distinguish a slot that ran from one that was merely configured,
+/// so silently mapping it onto `Produced` would import the exact ambiguity the
+/// change removes.
+pub const SIGNALS_FORMAT_VERSION: u32 = 2;
