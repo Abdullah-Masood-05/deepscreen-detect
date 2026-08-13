@@ -1,9 +1,11 @@
+> **ARCHIVED 2026-07-25** — all code moved into `deepscreen-viewer`. This repository is no longer built or referenced.
+
 # deepscreen-detect
 
 [![Rust](https://img.shields.io/badge/Rust-1.97-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![ONNX Runtime](https://img.shields.io/badge/ONNX%20Runtime-1.24-005CED?logo=onnx&logoColor=white)](https://onnxruntime.ai/)
 [![ort](https://img.shields.io/badge/ort-2.0.0--rc.12-purple)](https://github.com/pykeio/ort)
-[![Licence](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+[![Licence](https://img.shields.io/badge/licence-AGPL--3.0-blue)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](#requirements)
 
 Camera frames in, proctoring signals out. A plain Rust library — no UI, no
@@ -160,11 +162,9 @@ curl -LO https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc
 | Objects | [Megvii-BaseDetection/YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) | Apache 2.0 |
 | Identity | [deepinsight/insightface — buffalo_sc](https://github.com/deepinsight/insightface) | see upstream |
 
-YOLOX-Nano was chosen over the faster-sounding alternatives because it is
-Apache 2.0. Ultralytics' YOLO26n is AGPL-3.0, which would require open-sourcing
-anything that ships it or buying a commercial licence — and it measured 32.2 ms
-against YOLOX-Nano's 12.0 ms on this hardware, so the permissive option was
-also the quicker one.
+YOLOX-Nano was chosen because it is Apache 2.0 and it is faster. Ultralytics'
+YOLO26n is AGPL-3.0 and measured 32.2 ms against YOLOX-Nano's 12.0 ms on this
+hardware.
 
 ## Using the CLI
 
@@ -235,4 +235,4 @@ passes. Where they can, they check correctness rather than just latency:
 
 ## Licence
 
-MIT. Model weights carry their own licences — see the table above.
+AGPL-3.0. Model weights carry their own licences, see the table above.

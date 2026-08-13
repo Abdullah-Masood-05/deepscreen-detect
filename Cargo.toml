@@ -2,7 +2,7 @@
 name = "deepscreen-detect"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 description = "Camera frames in, proctoring violations out. No Tauri, no UI, no browser."
 
 # NOTE: this crate must never gain a `tauri` dependency (MODELS.md §0).
