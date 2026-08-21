@@ -1,4 +1,4 @@
-> **ARCHIVED 2026-07-25** — all code moved into `deepscreen-viewer`. This repository is no longer built or referenced.
+> **ARCHIVED 2026-07-25** — all code moved into `Vigilo`. This repository is no longer built or referenced.
 
 # deepscreen-detect
 
@@ -10,7 +10,7 @@
 
 Camera frames in, proctoring signals out. A plain Rust library — no UI, no
 window, no web view, and **no Tauri dependency**. The application that ships
-this library is [deepscreen-viewer](https://github.com/Abdullah-Masood-05/deepscreen-viewer).
+this library is [Vigilo](https://github.com/Abdullah-Masood-05/Vigilo).
 
 Written for an online-exam proctoring system that needs to answer, from a
 webcam alone: is one person present, are they looking at the screen, are their
